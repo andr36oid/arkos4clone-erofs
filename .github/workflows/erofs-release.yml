@@ -1,0 +1,138 @@
+name: EROFS release
+
+# Started by hand for one arkos4clone release. Each release upstream holds two
+# systems, ArkOS4Clone (ext4 root) and dArkOS4Clone (btrfs root), each a
+# multi-part 7z with an .img.xz inside. Each system becomes its own release
+# here with its own manifest.json, so andr36oid treats them as two systems.
+# Publishing the result is what declares that version usable.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: arkos4clone release tag (YYYYMMDD, for example 20261008)
+        required: true
+      systems:
+        description: Which systems to convert
+        type: choice
+        options: [both, ArkOS4Clone, dArkOS4Clone]
+        default: both
+      revision:
+        description: Our revision of this conversion (raise it to publish again)
+        required: true
+        default: "1"
+      prerelease:
+        description: Publish as a pre-release (installers only take full releases)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: lcdyk0517/arkos4clone
+  UPSTREAM_TAG: ${{ inputs.tag }}
+
+jobs:
+  pick:
+    runs-on: ubuntu-24.04
+    outputs:
+      systems: ${{ steps.pick.outputs.systems }}
+    steps:
+      - id: pick
+        run: |
+          case "${{ inputs.systems }}" in
+            both) echo 'systems=["ArkOS4Clone","dArkOS4Clone"]' ;;
+            *) echo 'systems=["${{ inputs.systems }}"]' ;;
+          esac >> "$GITHUB_OUTPUT"
+
+  convert:
+    needs: pick
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJSON(needs.pick.outputs.systems) }}
+    env:
+      DISTRIBUTION: ${{ matrix.system }}
+      IMAGE_PREFIX: ${{ matrix.system }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: erofs
+      - name: Make room and install tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils p7zip-full e2fsprogs btrfs-progs attr fdisk xz-utils
+          sudo modprobe erofs
+          sudo modprobe btrfs
+          # The unpacked image is 12 GiB; work on the larger /mnt disk.
+          sudo mkdir -p /mnt/w && sudo chown "$USER" /mnt/w
+          echo "W=/mnt/w" >> "$GITHUB_ENV"
+          df -h / /mnt
+      - name: Work out the version
+        run: |
+          # Upstream tags are YYYYMMDD; andr36oid keeps versions as MMDDYYYY.
+          tag="${{ inputs.tag }}"
+          case $tag in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) echo "tag must be YYYYMMDD" >&2; exit 1 ;; esac
+          version=${tag:4:4}${tag:0:4}
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # Same tag form as dArkOS-erofs (date-device-erofsN), with the system as
+          # the device part, so the SD flasher tells the two systems apart.
+          echo "RELEASE_TAG=$version-${{ matrix.system }}-erofs${{ inputs.revision }}" >> "$GITHUB_ENV"
+      - name: Download and check the parts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$W/dl" && cd "$W/dl"
+          # The pattern starts with the system name, so ArkOS4Clone never
+          # picks up the dArkOS4Clone parts.
+          gh release download "${{ inputs.tag }}" --repo "$UPSTREAM" --dir . --pattern "${{ matrix.system }}-*.img.xz.7z.*"
+          ls -la
+          gh api "repos/$UPSTREAM/releases/tags/${{ inputs.tag }}" \
+            --jq '.assets[] | select(.digest != null) | "\(.digest | sub("^sha256:"; ""))  \(.name)"' > "$W/digests"
+          for f in *; do
+            grep -q -F "  $f" "$W/digests" || { echo "GitHub lists no sha256 for $f" >&2; exit 1; }
+          done
+          sha256sum -c "$W/digests" --ignore-missing
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import hashlib, json, os
+          assets = []
+          for name in sorted(os.listdir(".")):
+              h = hashlib.sha256()
+              with open(name, "rb") as f:
+                  for block in iter(lambda: f.read(1 << 20), b""):
+                      h.update(block)
+              assets.append({"name": name, "size": os.path.getsize(name), "sha256": h.hexdigest()})
+          print("UPSTREAM_ASSETS=" + json.dumps(assets))
+          PY
+      - name: Unpack 7z, then xz
+        run: |
+          cd "$W/dl"
+          first=$(ls | sort | head -1)
+          7z l "$first" | tail -5
+          mkdir -p "$W/xz" "$W/img"
+          7z e -o"$W/xz" "$first" '*.img.xz' -r
+          rm -f ./*
+          xz=$(ls "$W"/xz/*.img.xz | head -1)
+          xz -t "$xz"
+          xz -dc "$xz" > "$W/img/${{ matrix.system }}.img"
+          rm -f "$xz"
+          ls -la "$W/img"
+          df -h /mnt
+      - name: Convert and verify
+        run: |
+          mkdir -p "$W/out"
+          sudo --preserve-env=UPSTREAM,UPSTREAM_TAG,UPSTREAM_ASSETS,DISTRIBUTION,IMAGE_PREFIX bash erofs/convert.sh "$W/img/${{ matrix.system }}.img" "$W/out" "$VERSION" "${{ inputs.revision }}"
+          sudo chown -R "$USER" "$W/out"
+          rm -f "$W/img/${{ matrix.system }}.img"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flag=""
+          [ "${{ inputs.prerelease }}" = "true" ] && flag="--prerelease"
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $flag \
+            --title "${{ matrix.system }} $VERSION as EROFS (revision ${{ inputs.revision }})" \
+            --notes "The root filesystem of ${{ matrix.system }} from arkos4clone ${{ inputs.tag }}, unchanged, as a compressed read-only EROFS image for andr36oid. Packed with xz; manifest.json lists files, sizes and checksums." \
+            "$W"/out/*
